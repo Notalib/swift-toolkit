@@ -1,5 +1,5 @@
 //
-//  Copyright 2022 Readium Foundation. All rights reserved.
+//  Copyright 2023 Readium Foundation. All rights reserved.
 //  Use of this source code is governed by the BSD-style license
 //  available in the top-level LICENSE file of the project.
 //
@@ -233,14 +233,18 @@ public class PublicationSpeechSynthesizer: Loggable {
                 delay: 0,
                 voiceOrLanguage: voiceOrLanguage(for: utterance)
             ),
-            onSpeakRange: { [unowned self] range in
-                state = .playing(
+            onSpeakRange: { [weak self] range in
+                guard let self = self else {
+                    return
+                }
+
+                self.state = .playing(
                     utterance,
                     range: utterance.locator.copy(
                         text: { text in
                             guard
                                 let highlight = text.highlight,
-                                highlight.startIndex <= range.lowerBound && highlight.endIndex >= range.upperBound
+                                highlight.startIndex <= range.lowerBound, highlight.endIndex >= range.upperBound
                             else {
                                 return
                             }
@@ -249,13 +253,17 @@ public class PublicationSpeechSynthesizer: Loggable {
                     )
                 )
             },
-            completion: { [unowned self] result in
+            completion: { [weak self] result in
+                guard let self = self else {
+                    return
+                }
+
                 switch result {
                 case .success:
-                    playNextUtterance(.forward)
-                case .failure(let error):
-                    state = .paused(utterance)
-                    delegate?.publicationSpeechSynthesizer(self, utterance: utterance, didFailWithError: .engine(error))
+                    self.playNextUtterance(.forward)
+                case let .failure(error):
+                    self.state = .paused(utterance)
+                    self.delegate?.publicationSpeechSynthesizer(self, utterance: utterance, didFailWithError: .engine(error))
                 }
             }
         )
