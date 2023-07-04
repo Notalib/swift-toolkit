@@ -6,7 +6,7 @@ Pod::Spec.new do |s|
   s.summary       = "R2 Streamer"
   s.homepage      = "http://readium.github.io"
   s.author        = { "Readium" => "contact@readium.org" }
-  s.source        = { :git => "https://github.com/Notalib/swift-toolkit.git", :branch => 'LYT4'}
+  s.source        = { :git => "https://github.com/Notalib/swift-toolkit.git", :branch => 'LYT4-beta'}
   s.requires_arc  = true
   s.resource_bundles = {
     'ReadiumStreamer' => [
