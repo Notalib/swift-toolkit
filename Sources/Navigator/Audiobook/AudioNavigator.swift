@@ -1043,8 +1043,8 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         didReportLoadingError = false
         queueFailureCount = 0
         loadAssetDuration()
-        // Reported before firing the timer, which reports right away the
-        // ranges already buffered for a queued item.
+        // Resets the ranges first: for a queued item, the timer reports
+        // ranges that are already buffered.
         lastLoadedTimeRanges = []
         delegate?.navigator(self, loadedTimeRangesDidChange: [])
         // Also checks whether the next resource can be queued.
@@ -1068,9 +1068,21 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     }
 
     /// Number of times the resource following the current one failed to be
-    /// queued. It is queued again once, in case of a transient network error,
-    /// then loaded only when moving on to it.
+    /// queued, up to `maxQueueAttempts`. After that, it is loaded only when
+    /// moving on to it.
     private var queueFailureCount = 0
+
+    /// Number of times the next resource is queued: once, then once more in
+    /// case of a transient network error.
+    private static let maxQueueAttempts = 2
+
+    /// Seconds of the current resource buffered ahead of the playback, from
+    /// which the next resource is queued.
+    private static let queueBufferedAhead: Double = 20
+
+    /// Seconds before the end of the current resource, from which the next
+    /// resource is queued however far the current one is buffered.
+    private static let queueBeforeEnd: Double = 45
 
     /// Queues the resource following the current one in the player, once
     /// `shouldQueueNextResource` allows it.
@@ -1081,7 +1093,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         let index = resourceIndex + 1
         guard
             queuedResourceIndex == nil,
-            queueFailureCount < 2,
+            queueFailureCount < Self.maxQueueAttempts,
             readingOrder.indices.contains(index),
             let currentItem = player.currentItem
         else {
@@ -1117,10 +1129,6 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         // of the next item. Loading its asset now at least answers the first
         // requests of the resource loader, which take several round trips
         // over HTTP.
-        //
-        // A queued item whose preload failed is removed from the queue, so
-        // that the resource is preloaded again with a new item, instead of
-        // being loaded only at the end of the current one.
         let asset = item.asset
         Task { [weak self] in
             do {
@@ -1145,6 +1153,9 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         return true
     }
 
+    /// Removes the queued `item` whose preload failed, so that the resource
+    /// is preloaded again with a new item, instead of being loaded only at
+    /// the end of the current one.
     private func queuedItem(_ item: AVPlayerItem, didFailWithError error: Error) {
         guard item === queuedItem, let index = queuedResourceIndex else {
             return
@@ -1167,7 +1178,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     ///   - remaining: Seconds left in the current resource, if its duration
     ///     is known.
     static func shouldQueueNextResource(bufferedAhead: Double, remaining: Double?) -> Bool {
-        bufferedAhead >= 20 || (remaining ?? .infinity) <= 45
+        bufferedAhead >= queueBufferedAhead || (remaining ?? .infinity) <= queueBeforeEnd
     }
 
     /// Removes the queued resource from the player.
