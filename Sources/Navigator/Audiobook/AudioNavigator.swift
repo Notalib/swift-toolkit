@@ -788,7 +788,9 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
             }
         }
 
-        itemStatusObserver = item?.observe(\.status) { [weak self] item, _ in
+        // `.initial` reports a queued item which failed after the navigator
+        // moved on to it, but before this observer was installed.
+        itemStatusObserver = item?.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             guard item.status == .failed else {
                 return
             }
@@ -1041,9 +1043,12 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         didReportLoadingError = false
         queueFailureCount = 0
         loadAssetDuration()
+        // Reported before firing the timer, which reports right away the
+        // ranges already buffered for a queued item.
+        lastLoadedTimeRanges = []
+        delegate?.navigator(self, loadedTimeRangesDidChange: [])
         // Also checks whether the next resource can be queued.
         loadedTimeRangesTimer.fire()
-        delegate?.navigator(self, loadedTimeRangesDidChange: [])
         return true
     }
 
@@ -1092,10 +1097,15 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
             return
         }
 
-        guard
-            let item = try? makePlayerItem(at: index),
-            player.canInsert(item, after: currentItem)
-        else {
+        let item: AVPlayerItem
+        do {
+            item = try makePlayerItem(at: index)
+        } catch {
+            log(.error, error)
+            queueFailureCount += 1
+            return
+        }
+        guard player.canInsert(item, after: currentItem) else {
             queueFailureCount += 1
             return
         }
@@ -1163,6 +1173,9 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     /// Removes the queued resource from the player.
     private func dequeueNextResource() {
         for item in player.items().dropFirst() {
+            // Stops a pending preload, which would compete with the current
+            // resource on a slow network.
+            item.asset.cancelLoading()
             player.remove(item)
         }
         queuedResourceIndex = nil
