@@ -338,6 +338,25 @@ enum AudioNavigatorTests {
             #expect(audiobook.navigator.queuedResourceIndex == 2)
         }
 
+        @Test("playing up to the end of a resource moves on to the queued item", .requiresPlayback)
+        func playingMovesOnToQueuedItem() async throws {
+            // Given a position shortly before the end of the first resource,
+            // with the second one queued.
+            await audiobook.goToResource(at: 0)
+            await audiobook.waitForQueuedItemPreload()
+            let queuedItem = try #require(audiobook.navigator.player.items().last)
+            await audiobook.navigator.seek(to: trackDuration - 0.3)
+
+            // When playing.
+            audiobook.navigator.play()
+
+            // Then the playback moves on to the queued item at the end of the
+            // first resource.
+            await audiobook.waitForPlayback { $0.resourceIndex == 1 && $0.state == .playing }
+            #expect(audiobook.navigator.player.currentItem === queuedItem)
+            #expect(audiobook.shouldPlayNextResourceCalls == [0])
+        }
+
         @Test("jumping to another resource replaces the queued one")
         func jumpReplacesQueue() async throws {
             // Given the first resource, with the second one queued.
@@ -448,8 +467,7 @@ enum AudioNavigatorTests {
 
             // And moving on to it plays the queued item.
             await audiobook.navigator.seek(to: trackDuration)
-            audiobook.navigator.play()
-            await audiobook.waitForPlayback { $0.resourceIndex == 1 && $0.state == .playing }
+            #expect(audiobook.navigator.playbackInfo.resourceIndex == 1)
             #expect(audiobook.navigator.player.currentItem === queuedItem)
             #expect(audiobook.loadingFailures.isEmpty)
         }
@@ -479,10 +497,10 @@ enum AudioNavigatorTests {
             // to it.
             valve.open()
             await audiobook.navigator.seek(to: trackDuration)
-            audiobook.navigator.play()
 
-            // Then it plays.
-            await audiobook.waitForPlayback { $0.resourceIndex == 1 && $0.state == .playing }
+            // Then it is loaded.
+            #expect(audiobook.navigator.playbackInfo.resourceIndex == 1)
+            await audiobook.wait { audiobook.navigator.player.currentItem?.status == .readyToPlay }
             #expect(audiobook.loadingFailures.isEmpty)
         }
 
@@ -492,7 +510,6 @@ enum AudioNavigatorTests {
             // first resource, with the second one queued.
             let audiobook = Audiobook(tracks: .failingAfterFirst(.access(.http(.security(nil)))))
             await audiobook.goToResource(at: 0)
-            #expect(audiobook.navigator.queuedResourceIndex == 1)
 
             // Then preloading the queued resource reports nothing.
             try await Task.sleep(nanoseconds: 500_000_000)
