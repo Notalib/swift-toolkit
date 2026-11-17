@@ -668,19 +668,31 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
                 guard let self = self else {
                     return
                 }
-                if href.isEquivalentTo(self.readingOrder[self.resourceIndex].url()) {
-                    self.didReportLoadingError = true
+                guard href.isEquivalentTo(self.readingOrder[self.resourceIndex].url()) else {
+                    // The queued next resource failed to preload. It is
+                    // loaded again if it becomes the current resource, which
+                    // reports the error then.
+                    self.log(.warning, "Failed to preload \(href): \(error)")
+                    return
                 }
+                self.didReportLoadingError = true
                 self.delegate?.navigator(self, didFailToLoadResourceAt: href, withError: error)
             }
         }
         return loader
     }()
 
-    private lazy var player: AVPlayer = makePlayer()
+    /// The queue holds the current resource followed by the next one, so that
+    /// the next resource loads while the current one plays. Moving on at the
+    /// end of a resource then starts from buffered data, without a pause long
+    /// enough for iOS to suspend an app playing in the background.
+    private lazy var player: AVQueuePlayer = makePlayer()
 
-    private func makePlayer() -> AVPlayer {
-        let player = AVPlayer()
+    private func makePlayer() -> AVQueuePlayer {
+        let player = AVQueuePlayer()
+        // The player holds the end of a resource, as it does for an
+        // `AVPlayer`, so that the delegate can decide whether to move on.
+        player.actionAtItemEnd = .pause
         player.allowsExternalPlayback = false
         player.automaticallyWaitsToMinimizeStalling = false
         player.volume = Float(settings.volume)
@@ -770,8 +782,12 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     }
 
     private func observe(currentItem item: AVPlayerItem?) {
-        itemLikelyToKeepUpObserver = item?.observe(\.isPlaybackLikelyToKeepUp) { [weak self] _, _ in
+        itemLikelyToKeepUpObserver = item?.observe(\.isPlaybackLikelyToKeepUp) { [weak self] item, _ in
+            let isLikelyToKeepUp = item.isPlaybackLikelyToKeepUp
             Task { @MainActor [weak self] in
+                if isLikelyToKeepUp {
+                    self?.preloadQueuedResource()
+                }
                 self?.playbackDidChange()
             }
         }
@@ -1008,19 +1024,94 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         }
 
         let link = readingOrder[index]
-        do {
-            log(.info, "Loads \(link.href)")
-            let asset = try mediaLoader.makeAsset(for: link.url(relativeTo: publication.baseURL))
-            player.replaceCurrentItem(with: AVPlayerItem(asset: asset))
-            resourceIndex = index
-            didReportLoadingError = false
-            loadAssetDuration()
-            loadedTimeRangesTimer.fire()
-            delegate?.navigator(self, loadedTimeRangesDidChange: [])
-            return true
-        } catch {
-            log(.error, error)
-            return false
+        if index == queuedResourceIndex, let item = queuedItem, item.status != .failed {
+            log(.info, "Plays queued \(link.href)")
+            player.advanceToNextItem()
+        } else {
+            do {
+                log(.info, "Loads \(link.href)")
+                let item = try makePlayerItem(at: index)
+                dequeueNextResource()
+                player.replaceCurrentItem(with: item)
+            } catch {
+                log(.error, error)
+                return false
+            }
+        }
+        resourceIndex = index
+        didReportLoadingError = false
+        loadAssetDuration()
+        loadedTimeRangesTimer.fire()
+        delegate?.navigator(self, loadedTimeRangesDidChange: [])
+        queueNextResource()
+        return true
+    }
+
+    private func makePlayerItem(at index: Int) throws -> AVPlayerItem {
+        let asset = try mediaLoader.makeAsset(for: readingOrder[index].url(relativeTo: publication.baseURL))
+        return AVPlayerItem(asset: asset)
+    }
+
+    // MARK: - Queued Resource
+
+    /// Index of the resource queued after the current one.
+    private var queuedResourceIndex: Int?
+
+    /// Whether the asset of the queued resource started loading.
+    private var isQueuedResourcePreloaded = false
+
+    /// Player item of the resource queued after the current one.
+    private var queuedItem: AVPlayerItem? {
+        guard queuedResourceIndex != nil else {
+            return nil
+        }
+        let items = player.items()
+        return items.count > 1 ? items[1] : nil
+    }
+
+    /// Queues the resource following the current one in the player.
+    private func queueNextResource() {
+        dequeueNextResource()
+        let index = resourceIndex + 1
+        guard
+            readingOrder.indices.contains(index),
+            let currentItem = player.currentItem,
+            let item = try? makePlayerItem(at: index),
+            player.canInsert(item, after: currentItem)
+        else {
+            return
+        }
+        player.insert(item, after: currentItem)
+        queuedResourceIndex = index
+        if currentItem.isPlaybackLikelyToKeepUp {
+            preloadQueuedResource()
+        }
+    }
+
+    /// Removes the queued resource from the player.
+    private func dequeueNextResource() {
+        for item in player.items().dropFirst() {
+            player.remove(item)
+        }
+        queuedResourceIndex = nil
+        isQueuedResourcePreloaded = false
+    }
+
+    /// Loads the asset of the queued resource, once the current one is
+    /// buffered so that both don't compete for a slow network.
+    ///
+    /// `AVQueuePlayer` decides on its own when it buffers the media data of
+    /// the next item. Loading its asset ahead of time at least answers the
+    /// first requests of the resource loader, which take several round trips
+    /// over HTTP.
+    private func preloadQueuedResource() {
+        guard !isQueuedResourcePreloaded, let item = queuedItem else {
+            return
+        }
+        isQueuedResourcePreloaded = true
+        let asset = item.asset
+        Task {
+            _ = try? await asset.load(.duration, .isPlayable)
         }
     }
 
