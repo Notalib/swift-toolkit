@@ -325,6 +325,7 @@ enum AudioNavigatorTests {
         func movingOnPlaysQueuedItem() async throws {
             // Given the first resource, with the second one queued.
             await audiobook.goToResource(at: 0)
+            await audiobook.waitForQueuedItemPreload()
             let queuedItem = try #require(audiobook.navigator.player.items().last)
 
             // When seeking up to the end of the first resource.
@@ -371,6 +372,118 @@ enum AudioNavigatorTests {
         )
         func queuedOnceBuffered(bufferedAhead: Double, remaining: Double?, queued: Bool) {
             #expect(AudioNavigator.shouldQueueNextResource(bufferedAhead: bufferedAhead, remaining: remaining) == queued)
+        }
+
+        @Test("the next resource is queued only once the current one is buffered far enough")
+        func queuedOnceCurrentIsBuffered() async throws {
+            // Given a long first resource, delivered up to 5 seconds of audio.
+            let first = Tracks.throttled(duration: 300, upTo: 5)
+            let audiobook = Audiobook(tracks: .stubs([first, Tracks.silent, Tracks.silent]))
+            let valve = try #require(first.resource.valve)
+
+            // When playing it.
+            await audiobook.goToResource(at: 0)
+            audiobook.navigator.play()
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+
+            // Then the next resource is not queued.
+            #expect(audiobook.navigator.queuedResourceIndex == nil)
+
+            // When the rest of the first resource is delivered.
+            valve.open()
+
+            // Then the next resource is queued.
+            await audiobook.wait { audiobook.navigator.queuedResourceIndex == 1 }
+        }
+
+        @Test("a failure of the current resource does not skip to the queued one")
+        func currentResourceFailureDoesNotSkip() async throws {
+            // Given a first resource close enough to its end to queue the
+            // next one, which fails after 3 seconds of audio.
+            let first = Tracks.throttled(duration: 40, upTo: 3)
+            let audiobook = Audiobook(tracks: .stubs([first, Tracks.silent, Tracks.silent]))
+            let valve = try #require(first.resource.valve)
+            await audiobook.goToResource(at: 0)
+            await audiobook.wait { audiobook.navigator.queuedResourceIndex == 1 }
+            let queuedItem = try #require(audiobook.navigator.player.items().last)
+            valve.fail(with: .access(.http(.timeout(nil))))
+
+            // When playing it.
+            audiobook.navigator.play()
+
+            // Then the failure is reported for the first resource.
+            let failure = try #require(await audiobook.waitForLoadingFailure())
+            #expect(failure.href.string == "track1.wav")
+
+            // And the playback stays on the first resource.
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+            #expect(audiobook.navigator.playbackInfo.resourceIndex == 0)
+            #expect(audiobook.navigator.player.currentItem !== queuedItem)
+            #expect(audiobook.shouldPlayNextResourceCalls.isEmpty)
+        }
+
+        @Test("a queued resource recovers from a transient read error, and plays when moving on")
+        func queuedResourceTransientReadError() async throws {
+            // Given a second resource whose first read fails.
+            let valve = StubResource.Valve(limit: 0)
+            valve.fail(with: .access(.http(.timeout(nil))), times: 1)
+            let second = Tracks.throttled(duration: trackDuration, upTo: 0, valve: valve)
+            let audiobook = Audiobook(tracks: .stubs([Tracks.silent, second, Tracks.silent]))
+
+            // When jumping to the first resource, which queues the second one.
+            await audiobook.goToResource(at: 0)
+            let queuedItem = try #require(audiobook.navigator.player.items().last)
+
+            // And the second resource can be read after the failure, which
+            // is handled before moving on.
+            await audiobook.wait { valve.remainingFailures == 0 }
+            try await Task.sleep(nanoseconds: 300_000_000)
+            valve.open()
+
+            // Then the player reads it again for the same queued item.
+            await audiobook.wait { second.resource.startedStreamCount > 1 }
+            #expect(audiobook.navigator.queuedResourceIndex == 1)
+            #expect(audiobook.navigator.player.items().last === queuedItem)
+            await audiobook.waitForQueuedItemPreload()
+
+            // And moving on to it plays the queued item.
+            await audiobook.navigator.seek(to: trackDuration)
+            audiobook.navigator.play()
+            await audiobook.waitForPlayback { $0.resourceIndex == 1 && $0.state == .playing }
+            #expect(audiobook.navigator.player.currentItem === queuedItem)
+            #expect(audiobook.loadingFailures.isEmpty)
+        }
+
+        @Test("a queued resource which keeps failing to preload is not queued again and again, and is loaded when moving on")
+        func queuedResourcePreloadFailure() async throws {
+            // Given a second resource which cannot be read yet.
+            let valve = StubResource.Valve(limit: 0)
+            valve.fail(with: .access(.http(.timeout(nil))))
+            let second = Tracks.throttled(duration: trackDuration, upTo: 0, valve: valve)
+            let audiobook = Audiobook(tracks: .stubs([Tracks.silent, second, Tracks.silent]))
+
+            // When jumping to the first resource.
+            await audiobook.goToResource(at: 0)
+
+            // Then the second resource is dropped from the queue after
+            // failing to preload, and is not read again and again.
+            await audiobook.wait { second.resource.startedStreamCount > 0 && audiobook.navigator.queuedResourceIndex == nil }
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            let streamCount = second.resource.startedStreamCount
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            #expect(second.resource.startedStreamCount == streamCount)
+            #expect(audiobook.navigator.queuedResourceIndex == nil)
+            #expect(audiobook.loadingFailures.isEmpty)
+
+            // When the second resource can be read, and the playback moves on
+            // to it.
+            valve.open()
+            await audiobook.navigator.seek(to: trackDuration)
+            audiobook.navigator.play()
+
+            // Then it plays.
+            await audiobook.waitForPlayback { $0.resourceIndex == 1 && $0.state == .playing }
+            #expect(audiobook.loadingFailures.isEmpty)
         }
 
         @Test("a loading failure of the queued resource is reported only once it is played")
@@ -468,6 +581,34 @@ private enum Tracks {
     /// The first track is a silent audio file, reading the others fails with
     /// the given error.
     case failingAfterFirst(ReadError)
+    /// Each track is a resource of the given duration, in seconds.
+    case stubs([(duration: Double, resource: StubResource)])
+
+    /// A silent track of `duration` seconds, delivered up to `seconds` of
+    /// audio until `valve` opens.
+    static func throttled(duration: Double, upTo seconds: Double, valve: StubResource.Valve? = nil) -> (duration: Double, resource: StubResource) {
+        let valve = valve ?? StubResource.Valve(limit: WAV.headerSize + Int(seconds * 16000))
+        return (duration, StubResource(.throttled(WAV.silence(duration: duration), valve)))
+    }
+
+    /// A silent track of `trackDuration` seconds.
+    static var silent: (duration: Double, resource: StubResource) {
+        (trackDuration, StubResource(.serving(WAV.silence(duration: trackDuration))))
+    }
+}
+
+/// A `Container` serving the given resources.
+private struct ResourceContainer: Container, @unchecked Sendable {
+    let sourceURL: AbsoluteURL? = nil
+    let resources: [AnyURL: Resource]
+
+    var entries: Set<AnyURL> {
+        Set(resources.keys)
+    }
+
+    subscript(url: any URLConvertible) -> Resource? {
+        resources[url.anyURL.normalized]
+    }
 }
 
 /// A `Container` whose entries all fail to be read with `error`.
@@ -528,9 +669,14 @@ private extension ReadError {
     init(
         audioSession: any AudioSessionManaging = NoopAudioSessionManager(),
         initialResourceIndex: Int? = nil,
-        hrefs: [String] = (1 ... trackCount).map { "track\($0).wav" },
+        hrefs: [String]? = nil,
         tracks: Tracks = .silence
     ) {
+        var durations = [Double](repeating: trackDuration, count: trackCount)
+        if case let .stubs(stubs) = tracks {
+            durations = stubs.map(\.duration)
+        }
+        let hrefs = hrefs ?? durations.indices.map { "track\($0 + 1).wav" }
         (playbacks, playbacksContinuation) = AsyncStream.makeStream()
         (loadingFailuresStream, loadingFailuresContinuation) = AsyncStream.makeStream()
 
@@ -549,12 +695,14 @@ private extension ReadError {
                 DataContainer(entries: [urls[0]: WAV.silence(duration: trackDuration)]),
                 FailingContainer(entries: Set(urls.dropFirst()), error: error)
             )
+        case let .stubs(stubs):
+            ResourceContainer(resources: Dictionary(uniqueKeysWithValues: zip(urls, stubs.map(\.resource))))
         }
         let publication = Publication(
             manifest: Manifest(
                 metadata: Metadata(conformsTo: [.audiobook], title: "Audiobook"),
-                readingOrder: hrefs.map {
-                    Link(href: $0, mediaType: .wav, duration: trackDuration)
+                readingOrder: zip(hrefs, durations).map {
+                    Link(href: $0, mediaType: .wav, duration: $1)
                 }
             ),
             container: container
@@ -608,6 +756,38 @@ private extension ReadError {
             return nil
         }
         return playback
+    }
+
+    /// Waits until `condition` is true, or fails the test after `timeout`
+    /// seconds.
+    func wait(
+        timeout: TimeInterval = .testTimeout,
+        sourceLocation: SourceLocation = #_sourceLocation,
+        until condition: () -> Bool
+    ) async {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while !condition() {
+            guard Date() < deadline else {
+                Issue.record("Timed out waiting for the condition", sourceLocation: sourceLocation)
+                return
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    /// Waits until the asset of the queued item is preloaded, so that moving
+    /// on plays the queued item.
+    func waitForQueuedItemPreload(sourceLocation: SourceLocation = #_sourceLocation) async {
+        await wait(sourceLocation: sourceLocation) {
+            guard
+                navigator.queuedResourceIndex != nil,
+                let item = navigator.player.items().dropFirst().first,
+                case .loaded = item.asset.status(of: .duration)
+            else {
+                return false
+            }
+            return true
+        }
     }
 
     /// Waits for the navigator to report a resource which failed to load, or

@@ -782,7 +782,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     }
 
     private func observe(currentItem item: AVPlayerItem?) {
-        itemLikelyToKeepUpObserver = item?.observe(\.isPlaybackLikelyToKeepUp) { [weak self] item, _ in
+        itemLikelyToKeepUpObserver = item?.observe(\.isPlaybackLikelyToKeepUp) { [weak self] _, _ in
             Task { @MainActor [weak self] in
                 self?.playbackDidChange()
             }
@@ -1022,7 +1022,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         }
 
         let link = readingOrder[index]
-        if index == queuedResourceIndex, let item = queuedItem, item.status != .failed {
+        if index == queuedResourceIndex, let item = queuedItem, Self.isPreloaded(item) {
             log(.info, "Plays queued \(link.href)")
             player.advanceToNextItem()
             dequeueNextResource()
@@ -1039,6 +1039,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         }
         resourceIndex = index
         didReportLoadingError = false
+        queueFailureCount = 0
         loadAssetDuration()
         // Also checks whether the next resource can be queued.
         loadedTimeRangesTimer.fire()
@@ -1058,12 +1059,13 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
 
     /// Player item of the resource queued after the current one.
     private var queuedItem: AVPlayerItem? {
-        guard queuedResourceIndex != nil else {
-            return nil
-        }
-        let items = player.items()
-        return items.count > 1 ? items[1] : nil
+        queuedResourceIndex == nil ? nil : player.items().dropFirst().first
     }
+
+    /// Number of times the resource following the current one failed to be
+    /// queued. It is queued again once, in case of a transient network error,
+    /// then loaded only when moving on to it.
+    private var queueFailureCount = 0
 
     /// Queues the resource following the current one in the player, once
     /// `shouldQueueNextResource` allows it.
@@ -1074,6 +1076,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         let index = resourceIndex + 1
         guard
             queuedResourceIndex == nil,
+            queueFailureCount < 2,
             readingOrder.indices.contains(index),
             let currentItem = player.currentItem
         else {
@@ -1093,6 +1096,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
             let item = try? makePlayerItem(at: index),
             player.canInsert(item, after: currentItem)
         else {
+            queueFailureCount += 1
             return
         }
         log(.info, "Queues \(readingOrder[index].href)")
@@ -1103,10 +1107,41 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         // of the next item. Loading its asset now at least answers the first
         // requests of the resource loader, which take several round trips
         // over HTTP.
+        //
+        // A queued item whose preload failed is removed from the queue, so
+        // that the resource is preloaded again with a new item, instead of
+        // being loaded only at the end of the current one.
         let asset = item.asset
-        Task {
-            _ = try? await asset.load(.duration, .isPlayable)
+        Task { [weak self] in
+            do {
+                _ = try await asset.load(.duration, .isPlayable)
+            } catch {
+                self?.queuedItem(item, didFailWithError: error)
+            }
         }
+    }
+
+    /// Whether the preload of the queued `item` succeeded.
+    ///
+    /// Only such an item is played when moving on. An item whose preload
+    /// failed or is still pending could leave the playback waiting without
+    /// a reported error, as a failure noticed while the resource was queued
+    /// is not reported. A new item is created instead, whose failures are
+    /// reported for the current resource.
+    private static func isPreloaded(_ item: AVPlayerItem) -> Bool {
+        guard item.status != .failed, case .loaded = item.asset.status(of: .duration) else {
+            return false
+        }
+        return true
+    }
+
+    private func queuedItem(_ item: AVPlayerItem, didFailWithError error: Error) {
+        guard item === queuedItem, let index = queuedResourceIndex else {
+            return
+        }
+        log(.warning, "Dequeues \(readingOrder[index].href) which failed to preload: \(error)")
+        queueFailureCount += 1
+        dequeueNextResource()
     }
 
     /// Whether the next resource can be queued and preloaded.

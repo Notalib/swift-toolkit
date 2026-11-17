@@ -8,6 +8,9 @@ import Foundation
 
 /// Generates WAV audio files, to play real audio without bundling fixtures.
 public enum WAV {
+    /// Size of the header preceding the samples, in bytes.
+    public static let headerSize = 44
+
     /// Returns a silent mono 16-bit PCM WAV file of the given `duration` in
     /// seconds, which takes 16 KB per second at the default sample rate.
     public static func silence(duration: Double, sampleRate: UInt32 = 8000) -> Data {

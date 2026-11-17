@@ -22,6 +22,50 @@ public final class StubResource: Resource {
         case failing(ReadError)
         /// The streams deliver nothing until their task is cancelled.
         case holding
+        /// The streams deliver the given data as `.serving` does, up to the
+        /// limit set by the valve. They end as soon as their task is
+        /// cancelled.
+        case throttled(Data, Valve)
+    }
+
+    /// Limits the bytes delivered by `.throttled` streams, as a network
+    /// slower than the playback.
+    public final class Valve: Sendable {
+        private let state: Mutex<(limit: Int, error: ReadError?, failures: Int)>
+
+        /// - Parameter limit: Offset up to which the data is delivered. The
+        ///   streams wait at this offset until the valve opens.
+        public init(limit: Int) {
+            state = Mutex((limit, nil, 0))
+        }
+
+        /// Delivers the rest of the data.
+        public func open() {
+            state.withLock { $0 = (.max, nil, 0) }
+        }
+
+        /// Fails the streams waiting at the limit, and the ones reading
+        /// beyond it, with `error`, `times` times.
+        public func fail(with error: ReadError, times: Int = .max) {
+            state.withLock { $0.error = error; $0.failures = times }
+        }
+
+        /// Number of streams which will still fail.
+        public var remainingFailures: Int {
+            state.withLock { $0.error == nil ? 0 : $0.failures }
+        }
+
+        /// Returns the limit, and the error to fail a stream reading at
+        /// `offset` with, if any.
+        func check(at offset: Int) -> (limit: Int, error: ReadError?) {
+            state.withLock { state in
+                guard offset >= state.limit, state.failures > 0, let error = state.error else {
+                    return (state.limit, nil)
+                }
+                state.failures -= 1
+                return (state.limit, error)
+            }
+        }
     }
 
     public enum StreamEvent: Sendable {
@@ -37,6 +81,7 @@ public final class StubResource: Resource {
     private let resourceProperties: ReadResult<ResourceProperties>
 
     private let activeStreams = Mutex(0)
+    private let startedStreams = Mutex(0)
     private let events: AsyncStream<StreamEvent>
     private let eventsContinuation: AsyncStream<StreamEvent>.Continuation
 
@@ -72,6 +117,20 @@ public final class StubResource: Resource {
         activeStreams.withLock { $0 }
     }
 
+    /// Valve of a `.throttled` resource.
+    public var valve: Valve? {
+        if case let .throttled(_, valve) = behavior {
+            valve
+        } else {
+            nil
+        }
+    }
+
+    /// Number of streams which started.
+    public var startedStreamCount: Int {
+        startedStreams.withLock { $0 }
+    }
+
     /// Waits until a stream reports `event`. Returns false when none did
     /// after `TimeInterval.testTimeout`.
     public func wait(for event: StreamEvent) async -> Bool {
@@ -91,7 +150,7 @@ public final class StubResource: Resource {
             return .success(nil)
         }
         return switch behavior {
-        case let .serving(data): .success(UInt64(data.count))
+        case let .serving(data), let .throttled(data, _): .success(UInt64(data.count))
         case .failing, .holding: .success(1024)
         }
     }
@@ -102,6 +161,7 @@ public final class StubResource: Resource {
 
     public func stream(range: Range<UInt64>?, consume: @escaping @Sendable (Data) -> Void) async -> ReadResult<Void> {
         activeStreams.withLock { $0 += 1 }
+        startedStreams.withLock { $0 += 1 }
         defer { activeStreams.withLock { $0 -= 1 } }
         eventsContinuation.yield(.started)
 
@@ -122,6 +182,26 @@ public final class StubResource: Resource {
 
         case let .failing(error):
             return .failure(error)
+
+        case let .throttled(data, valve):
+            var offset = Int(min(range?.lowerBound ?? 0, UInt64(data.count)))
+            let end = Int(min(range?.upperBound ?? .max, UInt64(data.count)))
+            while offset < end {
+                let (limit, error) = valve.check(at: offset)
+                if offset < limit {
+                    let chunkEnd = min(offset + Self.chunkSize, end, limit)
+                    consume(data[offset ..< chunkEnd])
+                    offset = chunkEnd
+                } else if let error {
+                    return .failure(error)
+                }
+                try? await Task.sleep(nanoseconds: offset < limit ? 1_000_000 : 10_000_000)
+                if Task.isCancelled {
+                    eventsContinuation.yield(.cancelled)
+                    return .failure(.cancelled)
+                }
+            }
+            return .success(())
 
         case .holding:
             // The sleep ends when the task is cancelled.
