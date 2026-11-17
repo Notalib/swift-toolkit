@@ -3,7 +3,13 @@
 All notable changes to this project will be documented in this file. Take a look at [the migration guide](docs/Migration%20Guide.md) to upgrade between two major versions.
 
 
-<!-- ## [Unreleased] -->
+## [Unreleased]
+
+### Fixed
+
+#### Navigator
+
+* The `AudioNavigator` no longer stops at the end of a resource when playing in the background over a slow network. The next resource is loaded while the current one plays, so the playback moves on without waiting for it.
 
 ## [4.0.0-alpha.3] - 2026-11-16
 

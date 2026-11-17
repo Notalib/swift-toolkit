@@ -686,7 +686,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     /// the next resource loads while the current one plays. Moving on at the
     /// end of a resource then starts from buffered data, without a pause long
     /// enough for iOS to suspend an app playing in the background.
-    private lazy var player: AVQueuePlayer = makePlayer()
+    private(set) lazy var player: AVQueuePlayer = makePlayer()
 
     private func makePlayer() -> AVQueuePlayer {
         let player = AVQueuePlayer()
@@ -1055,7 +1055,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     // MARK: - Queued Resource
 
     /// Index of the resource queued after the current one.
-    private var queuedResourceIndex: Int?
+    private(set) var queuedResourceIndex: Int?
 
     /// Whether the asset of the queued resource started loading.
     private var isQueuedResourcePreloaded = false

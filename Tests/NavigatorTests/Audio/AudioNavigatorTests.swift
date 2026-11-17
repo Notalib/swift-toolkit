@@ -4,6 +4,7 @@
 //  available in the top-level LICENSE file of the project.
 //
 
+import AVFoundation
 import Foundation
 @testable import ReadiumNavigator
 @_spi(ExperimentalSelectors) import ReadiumShared
@@ -297,6 +298,93 @@ enum AudioNavigatorTests {
         }
     }
 
+    @Suite("Queueing the next resource") @MainActor struct QueuedResource {
+        private let audiobook = Audiobook()
+
+        @Test("the next resource is queued after the current one")
+        func queued() async {
+            // When jumping to the first resource.
+            await audiobook.goToResource(at: 0)
+
+            // Then the second resource is queued after it.
+            #expect(audiobook.navigator.queuedResourceIndex == 1)
+            #expect(audiobook.navigator.player.items().count == 2)
+        }
+
+        @Test("nothing is queued after the last resource")
+        func notQueuedAfterLastResource() async {
+            // When jumping to the last resource.
+            await audiobook.goToResource(at: lastTrackIndex)
+
+            // Then nothing is queued.
+            #expect(audiobook.navigator.queuedResourceIndex == nil)
+            #expect(audiobook.navigator.player.items().count == 1)
+        }
+
+        @Test("moving on to the next resource plays the queued item")
+        func movingOnPlaysQueuedItem() async throws {
+            // Given the first resource, with the second one queued.
+            await audiobook.goToResource(at: 0)
+            let queuedItem = try #require(audiobook.navigator.player.items().last)
+
+            // When seeking up to the end of the first resource.
+            await audiobook.navigator.seek(to: trackDuration)
+
+            // Then the queued item is played, and the third resource is
+            // queued in turn.
+            #expect(audiobook.navigator.playbackInfo.resourceIndex == 1)
+            #expect(audiobook.navigator.player.currentItem === queuedItem)
+            #expect(audiobook.navigator.queuedResourceIndex == 2)
+        }
+
+        @Test("jumping to another resource replaces the queued one")
+        func jumpReplacesQueue() async throws {
+            // Given the first resource, with the second one queued.
+            await audiobook.goToResource(at: 0)
+            let queuedItem = try #require(audiobook.navigator.player.items().last)
+
+            // When jumping to the last resource.
+            await audiobook.goToResource(at: lastTrackIndex)
+
+            // Then the queued item is dropped.
+            #expect(audiobook.navigator.playbackInfo.resourceIndex == lastTrackIndex)
+            #expect(audiobook.navigator.player.currentItem !== queuedItem)
+            #expect(audiobook.navigator.player.items().count == 1)
+            #expect(audiobook.navigator.queuedResourceIndex == nil)
+
+            // When jumping back to the first resource.
+            await audiobook.goToResource(at: 0)
+
+            // Then the second resource is queued again.
+            #expect(audiobook.navigator.queuedResourceIndex == 1)
+        }
+
+        @Test("a loading failure of the queued resource is reported only once it is played")
+        func queuedResourceFailure() async throws {
+            // Given an audiobook whose second resource cannot be read, and the
+            // first resource, with the second one queued.
+            let audiobook = Audiobook(tracks: .failingAfterFirst(.access(.http(.security(nil)))))
+            await audiobook.goToResource(at: 0)
+            #expect(audiobook.navigator.queuedResourceIndex == 1)
+
+            // Then preloading the queued resource reports nothing.
+            try await Task.sleep(nanoseconds: 500_000_000)
+            #expect(audiobook.loadingFailures.isEmpty)
+
+            // When the playback is held at the end of the first resource, then
+            // played, which moves on to the second one.
+            audiobook.playsNextResource = false
+            await audiobook.navigator.seek(to: trackDuration)
+            #expect(audiobook.loadingFailures.isEmpty)
+            audiobook.navigator.play()
+
+            // Then its failure is reported.
+            let failure = try #require(await audiobook.waitForLoadingFailure())
+            #expect(failure.error.isHTTPSecurityError)
+            #expect(failure.href.string == "track2.wav")
+        }
+    }
+
     @Suite("Failing to load a resource") @MainActor struct LoadingFailure {
         @Test(
             "is reported to the delegate with the HREF of the resource",
@@ -363,6 +451,9 @@ private enum Tracks {
     case missing
     /// Reading the tracks fails with the given error.
     case failing(ReadError)
+    /// The first track is a silent audio file, reading the others fails with
+    /// the given error.
+    case failingAfterFirst(ReadError)
 }
 
 /// A `Container` whose entries all fail to be read with `error`.
@@ -439,6 +530,11 @@ private extension ReadError {
             DataContainer(entries: [:])
         case let .failing(error):
             FailingContainer(entries: Set(urls), error: error)
+        case let .failingAfterFirst(error):
+            CompositeContainer(
+                DataContainer(entries: [urls[0]: WAV.silence(duration: trackDuration)]),
+                FailingContainer(entries: Set(urls.dropFirst()), error: error)
+            )
         }
         let publication = Publication(
             manifest: Manifest(
