@@ -359,6 +359,20 @@ enum AudioNavigatorTests {
             #expect(audiobook.navigator.queuedResourceIndex == 1)
         }
 
+        @Test(
+            "the next resource waits until the current one is buffered far enough, or is close to its end",
+            arguments: [
+                (bufferedAhead: 0.0, remaining: 300.0, queued: false),
+                (bufferedAhead: 19.0, remaining: nil, queued: false),
+                (bufferedAhead: 20.0, remaining: 300.0, queued: true),
+                (bufferedAhead: 0.0, remaining: 45.0, queued: true),
+                (bufferedAhead: 5.0, remaining: 5.0, queued: true),
+            ] as [(bufferedAhead: Double, remaining: Double?, queued: Bool)]
+        )
+        func queuedOnceBuffered(bufferedAhead: Double, remaining: Double?, queued: Bool) {
+            #expect(AudioNavigator.shouldQueueNextResource(bufferedAhead: bufferedAhead, remaining: remaining) == queued)
+        }
+
         @Test("a loading failure of the queued resource is reported only once it is played")
         func queuedResourceFailure() async throws {
             // Given an audiobook whose second resource cannot be read, and the

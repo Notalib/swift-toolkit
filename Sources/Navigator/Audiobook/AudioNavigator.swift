@@ -783,11 +783,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
 
     private func observe(currentItem item: AVPlayerItem?) {
         itemLikelyToKeepUpObserver = item?.observe(\.isPlaybackLikelyToKeepUp) { [weak self] item, _ in
-            let isLikelyToKeepUp = item.isPlaybackLikelyToKeepUp
             Task { @MainActor [weak self] in
-                if isLikelyToKeepUp {
-                    self?.preloadQueuedResource()
-                }
                 self?.playbackDidChange()
             }
         }
@@ -944,6 +940,8 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
                     return start ..< (start + duration)
                 }
 
+            self.queueNextResourceIfBuffered(loadedTimeRanges: ranges)
+
             guard ranges != self.lastLoadedTimeRanges else {
                 return
             }
@@ -1027,6 +1025,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         if index == queuedResourceIndex, let item = queuedItem, item.status != .failed {
             log(.info, "Plays queued \(link.href)")
             player.advanceToNextItem()
+            dequeueNextResource()
         } else {
             do {
                 log(.info, "Loads \(link.href)")
@@ -1041,9 +1040,9 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         resourceIndex = index
         didReportLoadingError = false
         loadAssetDuration()
+        // Also checks whether the next resource can be queued.
         loadedTimeRangesTimer.fire()
         delegate?.navigator(self, loadedTimeRangesDidChange: [])
-        queueNextResource()
         return true
     }
 
@@ -1057,9 +1056,6 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     /// Index of the resource queued after the current one.
     private(set) var queuedResourceIndex: Int?
 
-    /// Whether the asset of the queued resource started loading.
-    private var isQueuedResourcePreloaded = false
-
     /// Player item of the resource queued after the current one.
     private var queuedItem: AVPlayerItem? {
         guard queuedResourceIndex != nil else {
@@ -1069,23 +1065,64 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         return items.count > 1 ? items[1] : nil
     }
 
-    /// Queues the resource following the current one in the player.
-    private func queueNextResource() {
-        dequeueNextResource()
+    /// Queues the resource following the current one in the player, once
+    /// `shouldQueueNextResource` allows it.
+    ///
+    /// - Parameter loadedTimeRanges: Time ranges of the current resource
+    ///   loaded in the player.
+    private func queueNextResourceIfBuffered(loadedTimeRanges: [Range<Double>]) {
         let index = resourceIndex + 1
         guard
+            queuedResourceIndex == nil,
             readingOrder.indices.contains(index),
-            let currentItem = player.currentItem,
+            let currentItem = player.currentItem
+        else {
+            return
+        }
+
+        let time = currentTime
+        let bufferedAhead = loadedTimeRanges
+            .first { $0.lowerBound <= time && time <= $0.upperBound }
+            .map { $0.upperBound - time } ?? 0
+        let remaining = resourceDuration.map { $0 - time }
+        guard Self.shouldQueueNextResource(bufferedAhead: bufferedAhead, remaining: remaining) else {
+            return
+        }
+
+        guard
             let item = try? makePlayerItem(at: index),
             player.canInsert(item, after: currentItem)
         else {
             return
         }
+        log(.info, "Queues \(readingOrder[index].href)")
         player.insert(item, after: currentItem)
         queuedResourceIndex = index
-        if currentItem.isPlaybackLikelyToKeepUp {
-            preloadQueuedResource()
+
+        // `AVQueuePlayer` decides on its own when it buffers the media data
+        // of the next item. Loading its asset now at least answers the first
+        // requests of the resource loader, which take several round trips
+        // over HTTP.
+        let asset = item.asset
+        Task {
+            _ = try? await asset.load(.duration, .isPlayable)
         }
+    }
+
+    /// Whether the next resource can be queued and preloaded.
+    ///
+    /// The next resource waits until the current one is buffered far enough
+    /// ahead, so that both don't compete for a slow network at the start of
+    /// the current one. It is queued anyway close to the end of the current
+    /// resource, to be ready in time when the network never buffers that
+    /// far.
+    ///
+    /// - Parameters:
+    ///   - bufferedAhead: Seconds buffered after the current time.
+    ///   - remaining: Seconds left in the current resource, if its duration
+    ///     is known.
+    static func shouldQueueNextResource(bufferedAhead: Double, remaining: Double?) -> Bool {
+        bufferedAhead >= 20 || (remaining ?? .infinity) <= 45
     }
 
     /// Removes the queued resource from the player.
@@ -1094,25 +1131,6 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
             player.remove(item)
         }
         queuedResourceIndex = nil
-        isQueuedResourcePreloaded = false
-    }
-
-    /// Loads the asset of the queued resource, once the current one is
-    /// buffered so that both don't compete for a slow network.
-    ///
-    /// `AVQueuePlayer` decides on its own when it buffers the media data of
-    /// the next item. Loading its asset ahead of time at least answers the
-    /// first requests of the resource loader, which take several round trips
-    /// over HTTP.
-    private func preloadQueuedResource() {
-        guard !isQueuedResourcePreloaded, let item = queuedItem else {
-            return
-        }
-        isQueuedResourcePreloaded = true
-        let asset = item.asset
-        Task {
-            _ = try? await asset.load(.duration, .isPlayable)
-        }
     }
 
     /// Returns the duration of the current resource, waiting for its asset
