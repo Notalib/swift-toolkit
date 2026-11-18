@@ -380,17 +380,25 @@ enum AudioNavigatorTests {
         }
 
         @Test(
-            "the next resource waits until the current one is buffered far enough, or is close to its end",
+            "the next resource waits until the current one is buffered far enough, or is close to its end, and is not loading",
             arguments: [
-                (bufferedAhead: 0.0, remaining: 300.0, queued: false),
-                (bufferedAhead: 19.0, remaining: nil, queued: false),
-                (bufferedAhead: 20.0, remaining: 300.0, queued: true),
-                (bufferedAhead: 0.0, remaining: 45.0, queued: true),
-                (bufferedAhead: 5.0, remaining: 5.0, queued: true),
-            ] as [(bufferedAhead: Double, remaining: Double?, queued: Bool)]
+                (isLoading: false, bufferedAhead: 0.0, remaining: 300.0, queued: false),
+                (isLoading: false, bufferedAhead: 19.0, remaining: nil, queued: false),
+                (isLoading: false, bufferedAhead: 20.0, remaining: 300.0, queued: true),
+                (isLoading: false, bufferedAhead: 0.0, remaining: 45.0, queued: true),
+                (isLoading: false, bufferedAhead: 5.0, remaining: 5.0, queued: true),
+                (isLoading: true, bufferedAhead: 20.0, remaining: 300.0, queued: false),
+                (isLoading: true, bufferedAhead: 0.0, remaining: 45.0, queued: false),
+            ] as [(isLoading: Bool, bufferedAhead: Double, remaining: Double?, queued: Bool)]
         )
-        func queuedOnceBuffered(bufferedAhead: Double, remaining: Double?, queued: Bool) {
-            #expect(AudioNavigator.shouldQueueNextResource(bufferedAhead: bufferedAhead, remaining: remaining) == queued)
+        func queuedOnceBuffered(isLoading: Bool, bufferedAhead: Double, remaining: Double?, queued: Bool) {
+            #expect(
+                AudioNavigator.shouldQueueNextResource(
+                    isLoading: isLoading,
+                    bufferedAhead: bufferedAhead,
+                    remaining: remaining
+                ) == queued
+            )
         }
 
         @Test("the next resource is queued only once the current one is buffered far enough")

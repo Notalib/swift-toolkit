@@ -1105,7 +1105,11 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
             .first { $0.lowerBound <= time && time <= $0.upperBound }
             .map { $0.upperBound - time } ?? 0
         let remaining = resourceDuration.map { $0 - time }
-        guard Self.shouldQueueNextResource(bufferedAhead: bufferedAhead, remaining: remaining) else {
+        guard Self.shouldQueueNextResource(
+            isLoading: state == .loading,
+            bufferedAhead: bufferedAhead,
+            remaining: remaining
+        ) else {
             return
         }
 
@@ -1171,14 +1175,17 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     /// ahead, so that both don't compete for a slow network at the start of
     /// the current one. It is queued anyway close to the end of the current
     /// resource, to be ready in time when the network never buffers that
-    /// far.
+    /// far. Nothing is queued while the playback waits for data of the
+    /// current resource, even with enough of it buffered: the player may
+    /// wait for more before resuming.
     ///
     /// - Parameters:
+    ///   - isLoading: Whether the playback is waiting for data.
     ///   - bufferedAhead: Seconds buffered after the current time.
     ///   - remaining: Seconds left in the current resource, if its duration
     ///     is known.
-    static func shouldQueueNextResource(bufferedAhead: Double, remaining: Double?) -> Bool {
-        bufferedAhead >= queueBufferedAhead || (remaining ?? .infinity) <= queueBeforeEnd
+    static func shouldQueueNextResource(isLoading: Bool, bufferedAhead: Double, remaining: Double?) -> Bool {
+        !isLoading && (bufferedAhead >= queueBufferedAhead || (remaining ?? .infinity) <= queueBeforeEnd)
     }
 
     /// Removes the queued resource from the player.
